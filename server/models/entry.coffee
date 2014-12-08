@@ -75,6 +75,7 @@ entrySchema = new mongoose.Schema
       delete ret._id
       delete ret.__v
       ret
+  strict: false
 
 entrySchema.pre 'save', (next) ->
   @lastModified = Date.now()
@@ -169,5 +170,81 @@ entrySchema.statics.findByParams = (params, callback) ->
           callback err
         else
           callback null, entries
+
+do ->
+  async = require 'async'
+  _ = require 'underscore'
+  Bucket = require './bucket'
+  winston = require 'winston' # TODO remove
+
+  # Keep a local cache of buckets and an inverse index for field types
+  buckets = []
+  fieldsPerFieldTypePerBucket = {}
+
+  bucketsLoaded = false
+  loadBuckets = (callback) ->
+    bucketsLoaded = false
+    buckets.length = 0 # Don't invalidate references
+    Bucket.find {}, (err, docs) ->
+      buckets = docs
+      buckets.forEach (bucket) ->
+        fieldsPerFieldTypePerBucket[bucket.id] = {}
+        for field in bucket.get 'fields'
+          fieldsPerFieldTypePerBucket[bucket.id][field.fieldType] ?= []
+          fieldsPerFieldTypePerBucket[bucket.id][field.fieldType].push field
+      bucketsLoaded = true
+      callback err if callback
+
+  onceBucketsAreLoadedQueue = []
+  onceBucketsAreLoaded = (f) ->
+    onceBucketsAreLoadedQueue.push f
+  whenBucketsAreLoaded = ->
+    do f for f in onceBucketsAreLoadedQueue
+    onceBucketsAreLoadedQueue.length = 0
+
+  loadBuckets -> whenBucketsAreLoaded()
+  #TODO reload buckets cache every time buckets are changed
+
+  # This middleware cache is what it's all about
+  # Middleware gets called dynamically from this possibly huge object
+  # Looks a bit like:
+  # bucket1: pre: save: markdown: (doc, fields, next) -> next()
+  fieldTypeMW = {}
+
+  # Initiate all possible kinds of middleware
+  for preOrPost in ['pre', 'post']
+    for action in ['validate', 'init', 'save']
+      do (preOrPost, action) ->
+        entrySchema[preOrPost] action, (docOrNext) ->
+          next = if preOrPost is 'pre' then docOrNext else ->
+          doc = if preOrPost is 'pre' then @ else docOrNext
+          bucket = doc.get 'bucket'
+          bucketID = if _.isObject(bucket) then bucket.toHexString?() or bucket.id else bucket # Sometimes it's an id, sometimes an obj
+
+          return next() unless bucketID of fieldTypeMW and preOrPost of fieldTypeMW[bucketID] and action of fieldTypeMW[bucketID][preOrPost]
+
+          finalCallbacks = []
+          for fieldType, middlewares of fieldTypeMW[bucketID][preOrPost][action]
+            relatedFields = fieldsPerFieldTypePerBucket[bucketID][fieldType]
+            finalCallbacks.push (do (middleware)-> (callback)-> middleware(doc, relatedFields, callback)) for middleware in middlewares
+
+          async.series finalCallbacks, next # TODO maybe consider parallel
+
+
+  # Implements an interface to add new middleware
+  entrySchema.statics.addFieldTypeMiddleware = (fieldType, preOrPost, action, callback) ->
+    onceBucketsAreLoaded ->
+      winston.warn "No buckets loaded" if _.isEmpty buckets
+      for bucket in buckets
+        relatedFields = _.where bucket.get('fields'), fieldType: fieldType
+        continue if _.isEmpty relatedFields # Don't set up middleware if the bucket is not concerned
+
+        fieldTypeMW[bucket.id] ?= {}
+        fieldTypeMW[bucket.id][preOrPost] ?= {}
+        fieldTypeMW[bucket.id][preOrPost][action] ?= {}
+        fieldTypeMW[bucket.id][preOrPost][action][fieldType] ?= []
+        fieldTypeMW[bucket.id][preOrPost][action][fieldType].push callback
+        winston.debug "successfully registered middleware for #{fieldType} in #{bucket.id}"
+
 
 module.exports = db.model 'Entry', entrySchema
